@@ -1,0 +1,177 @@
+name: Playwright Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Secrets your tests reference via process.env.<NAME> go here.
+    # Add them in: Settings → Secrets and variables → Actions
+    env:
+      X_USERNAME: ${{ secrets.X_USERNAME }}
+      X_PASSWORD: ${{ secrets.X_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install --no-audit --no-fund
+
+      - id: detect_tests
+        name: Check for test files
+        run: |
+          if compgen -G "tests/*.spec.ts" > /dev/null; then
+            echo "has_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tests=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No tests under tests/*.spec.ts yet — skipping playwright run."
+          fi
+
+      - if: steps.detect_tests.outputs.has_tests == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - if: steps.detect_tests.outputs.has_tests == 'true' && env.SHIFTX_API_KEY != ''
+        name: Fetch Playwright storage state
+        env:
+          SHIFTX_API_URL: ${{ secrets.SHIFTX_API_URL }}
+          SHIFTX_API_KEY: ${{ secrets.SHIFTX_API_KEY }}
+          SHIFTX_PROJECT_ID: ${{ secrets.SHIFTX_PROJECT_ID }}
+        run: |
+          API_URL="$(printf '%s' "${SHIFTX_API_URL}" | tr -cd '[:print:]' | tr -d ' ' | sed 's|/$||')"
+          mkdir -p playwright/.auth
+          if curl -sf -H "x-api-key: $SHIFTX_API_KEY" \
+              "${API_URL}/projects/$SHIFTX_PROJECT_ID/storage-state" \
+              -o playwright/.auth/user.json 2>/dev/null; then
+            echo "PW_STORAGE_STATE=$PWD/playwright/.auth/user.json" >> "$GITHUB_ENV"
+          else
+            echo "::notice::No storage state found for this project — running without pre-auth."
+          fi
+
+      - if: steps.detect_tests.outputs.has_tests == 'true'
+        name: Run Playwright tests
+        run: npx playwright test --reporter=html,json
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+        continue-on-error: true
+
+      - name: Export run identifiers
+        if: always()
+        env:
+          PROJECT_ID: ${{ secrets.SHIFTX_PROJECT_ID }}
+        run: |
+          echo "RUN_ID=run-${{ github.run_number }}"            >> "$GITHUB_ENV"
+          echo "STORAGE_PATH=${PROJECT_ID}/run-${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Upload report files to Supabase Storage
+        if: always() && steps.detect_tests.outputs.has_tests == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          BUCKET="playwright-reports"
+
+          upload_file() {
+            local FILE_PATH="$1"
+            local OBJECT_PATH="$2"
+            local MIME="$3"
+            RESP=$(curl -s -w "\n%{http_code}" -X POST \
+              "${SUPABASE_URL}/storage/v1/object/${BUCKET}/${OBJECT_PATH}" \
+              -H "apikey: ${SUPABASE_SECRET_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
+              -H "Content-Type: ${MIME}" \
+              --data-binary "@${FILE_PATH}")
+            HTTP_CODE=$(echo "$RESP" | tail -1)
+            BODY=$(echo "$RESP" | head -1)
+            if [ "$HTTP_CODE" -ge 400 ]; then
+              echo "Upload failed [$HTTP_CODE] $OBJECT_PATH: $BODY"
+            fi
+          }
+
+          if [ -f results.json ]; then
+            upload_file "results.json" "${STORAGE_PATH}/results.json" "application/json"
+          fi
+
+          if [ -d "playwright-report" ]; then
+            find playwright-report -type f | while IFS= read -r f; do
+              REL="${f#playwright-report/}"
+              EXT="${f##*.}"
+              case "$EXT" in
+                html) MIME="text/html" ;;
+                js)   MIME="application/javascript" ;;
+                css)  MIME="text/css" ;;
+                png)  MIME="image/png" ;;
+                *)    MIME="application/octet-stream" ;;
+              esac
+              upload_file "$f" "${STORAGE_PATH}/${REL}" "$MIME"
+            done
+          fi
+
+      - name: Parse test results
+        if: always() && steps.detect_tests.outputs.has_tests == 'true'
+        id: parse
+        run: |
+          if [ -f results.json ]; then
+            TOTAL=$(node -e "const r=require('./results.json'); console.log(r.stats.expected + r.stats.unexpected + r.stats.flaky + r.stats.skipped)")
+            PASSED=$(node -e "const r=require('./results.json'); console.log(r.stats.expected)")
+            FAILED=$(node -e "const r=require('./results.json'); console.log(r.stats.unexpected)")
+            SKIPPED=$(node -e "const r=require('./results.json'); console.log(r.stats.skipped)")
+            DURATION=$(node -e "const r=require('./results.json'); console.log(Math.round(r.stats.duration))")
+            STATUS=$([ "$FAILED" -eq 0 ] && echo "passed" || echo "failed")
+          else
+            TOTAL=0; PASSED=0; FAILED=0; SKIPPED=0; DURATION=0; STATUS="error"
+          fi
+          echo "total=$TOTAL"       >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED"     >> "$GITHUB_OUTPUT"
+          echo "failed=$FAILED"     >> "$GITHUB_OUTPUT"
+          echo "skipped=$SKIPPED"   >> "$GITHUB_OUTPUT"
+          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS"     >> "$GITHUB_OUTPUT"
+
+      - name: Register run in API
+        if: always() && steps.detect_tests.outputs.has_tests == 'true'
+        env:
+          SHIFTX_API_URL: ${{ secrets.SHIFTX_API_URL }}
+          SHIFTX_API_KEY: ${{ secrets.SHIFTX_API_KEY }}
+          PROJECT_ID: ${{ secrets.SHIFTX_PROJECT_ID }}
+        run: |
+          echo "=== URL debug ==="
+          echo "Byte length: ${#SHIFTX_API_URL}"
+          printf '%s' "${SHIFTX_API_URL}" | cat -A
+          echo "Hex dump:"
+          printf '%s' "${SHIFTX_API_URL}" | xxd | head -4
+          echo "================="
+          API_URL="$(printf '%s' "${SHIFTX_API_URL}" | tr -cd '[:print:]' | tr -d ' ' | sed 's|/$||')"
+          echo "Cleaned URL length: ${#API_URL}"
+          curl --fail-with-body -X POST "${API_URL}/reports/runs" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${SHIFTX_API_KEY}" \
+            -d '{
+              "project_id":   "'"${PROJECT_ID}"'",
+              "run_id":       "'"${RUN_ID}"'",
+              "branch":       "${{ github.ref_name }}",
+              "commit_sha":   "${{ github.sha }}",
+              "status":       "${{ steps.parse.outputs.status }}",
+              "total_tests":  ${{ steps.parse.outputs.total }},
+              "passed":       ${{ steps.parse.outputs.passed }},
+              "failed":       ${{ steps.parse.outputs.failed }},
+              "skipped":      ${{ steps.parse.outputs.skipped }},
+              "duration_ms":  ${{ steps.parse.outputs.duration }},
+              "storage_path": "'"${STORAGE_PATH}"'"
+            }'
+
+      - if: always() && steps.detect_tests.outputs.has_tests == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+          if-no-files-found: ignore
